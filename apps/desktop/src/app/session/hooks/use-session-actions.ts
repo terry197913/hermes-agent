@@ -391,6 +391,16 @@ function applyStoredSessionPreviewRuntimeInfo(stored: { model?: null | string } 
   setCurrentPersonality('')
 }
 
+// A "session genuinely doesn't exist" failure (deleted, or an id from a wiped /
+// rotated backend) — the REST transcript 404s with `Session not found`. Distinct
+// from a transient/wedged backend (ECONNREFUSED, timeout), which must still
+// retry rather than discard the id.
+function isSessionGoneError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err ?? '')
+
+  return message.includes('404') || /session not found/i.test(message)
+}
+
 export function useSessionActions({
   activeSessionId,
   activeSessionIdRef,
@@ -810,6 +820,8 @@ export function useSessionActions({
         // empty transcript. That is the exact state the thread loader latches on
         // forever (messagesEmpty && !activeSessionId) with no recovery path —
         // the "open in new window stays stuck loading, even after a nap" bug.
+        let fallbackError: unknown = null
+
         try {
           const fallback = await getSessionMessages(storedSessionId, sessionProfile)
 
@@ -818,14 +830,31 @@ export function useSessionActions({
           }
 
           setMessages(preserveLocalAssistantErrors(toChatMessages(fallback.messages), $messages.get()))
-        } catch {
+        } catch (e) {
           // Fallback also failed: nothing to paint. Leave whatever messages are
           // already shown and fall through to arm the resume-failure latch so
           // use-route-resume re-attempts the resume on the next render / window
           // focus / gateway reconnect instead of stranding the loader.
+          fallbackError = e
         }
 
-        if (isCurrentResume() && $messages.get().length === 0) {
+        if (!isCurrentResume()) {
+          return
+        }
+
+        // The session is genuinely gone (deleted, or a stale id from a wiped /
+        // rotated backend): the resume RPC and the authoritative REST transcript
+        // both 404. There's nothing to recover — silently drop to a fresh draft
+        // instead of toasting an error and hot-looping the bounded retry on a
+        // permanently-dead id. (Booting straight into a no-longer-existent
+        // last-session id is the common trigger.)
+        if ($messages.get().length === 0 && isSessionGoneError(fallbackError)) {
+          startFreshSessionDraft(true)
+
+          return
+        }
+
+        if ($messages.get().length === 0) {
           // Arm the self-heal ONLY when the window is still empty: the gateway
           // resume rejected AND the REST fallback failed to paint a transcript.
           // That is the exact stranded state the loader latches on
@@ -854,6 +883,7 @@ export function useSessionActions({
       runtimeIdByStoredSessionIdRef,
       selectedStoredSessionIdRef,
       sessionStateByRuntimeIdRef,
+      startFreshSessionDraft,
       syncSessionStateToView,
       updateSessionState
     ]
