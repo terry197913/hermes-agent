@@ -6,7 +6,7 @@ import type {
   BillingStateResponse
 } from '../../../gatewayTypes.js'
 import { openExternalUrl } from '../../../lib/openExternalUrl.js'
-import type { BillingOverlayCtx } from '../../interfaces.js'
+import type { BillingChargeOutcome, BillingOverlayCtx } from '../../interfaces.js'
 import { patchOverlayState } from '../../overlayStore.js'
 import type { SlashCommand, SlashRunCtx } from '../types.js'
 
@@ -35,9 +35,12 @@ const renderBillingError = (
 
   switch (env.error) {
     case 'insufficient_scope':
-      armStepUp(sys, ctx)
+      // Reached by non-charge mutations (e.g. auto-reload config) that need the
+      // Remote-Spending grant. The resumable step-up lives on the buy/charge
+      // path; point the user there rather than leaking the raw scope name.
+      sys('💳 This needs Remote Spending authorization. Start a credit purchase to authorize, then retry.')
 
-      return
+      break
 
     case 'remote_spending_revoked': {
       // CF-4: this terminal's spend was revoked. Kill the spend UI NOW (don't
@@ -110,65 +113,23 @@ const renderBillingError = (
   }
 }
 
-/** 403 insufficient_scope → arm a ConfirmReq that runs the lazy step-up. */
-const armStepUp = (sys: Sys, ctx: SlashRunCtx): void => {
-  sys('💳 Terminal billing needs an extra permission (billing:manage).')
-  patchOverlayState({
-    confirm: {
-      cancelLabel: 'Not now',
-      confirmLabel: 'Re-authorize',
-      detail: 'An org admin/owner must tick "Allow terminal billing" in the portal.',
-      onConfirm: () => {
-        // session_id lets the gateway route the billing.step_up.verification
-        // event (the verification link) back to this session — the device flow
-        // runs headless in the gateway, so the link can't be printed there.
-        ctx.gateway
-          .rpc<BillingMutationResponse>('billing.step_up', { session_id: ctx.sid ?? undefined })
-          .then(
-            ctx.guarded<BillingMutationResponse>(r => {
-              if (r.ok && r.granted) {
-                // Step-up only grants the billing:manage TOKEN scope — the ORG
-                // kill-switch (cli_billing_enabled) is a separate gate. Re-fetch
-                // /state so we don't over-promise "enabled" when a charge would
-                // still hit cli_billing_disabled.
-                sys('✅ Billing permission granted.')
-                ctx.gateway
-                  .rpc<BillingStateResponse>('billing.state', {})
-                  .then(
-                    ctx.guarded<BillingStateResponse>(s => {
-                      if (s.cli_billing_enabled) {
-                        sys('Run /billing again to continue.')
-                      } else {
-                        sys(
-                          '🟡 Permission granted, but terminal billing is still turned off ' +
-                            'for this org. Enable it in the portal, then run /billing again.'
-                        )
-                        if (s.portal_url) {
-                          sys(`Portal: ${s.portal_url}`)
-                        }
-                      }
-                    })
-                  )
-                  .catch(() => {
-                    sys('Run /billing again to continue.')
-                  })
-              } else {
-                sys('🟡 Terminal billing was not granted (an admin must tick the box).')
-              }
-            })
-          )
-          .catch(() => {
-            // The device flow can outlive the RPC's 120s timeout while the user
-            // is still authorizing in the browser. A reject here is NOT a hard
-            // failure — the grant (if it lands) is persisted gateway-side; tell
-            // the user to re-run /billing rather than reporting an error.
-            sys('🟡 Still waiting on approval — finish in the browser, then run /billing again.')
-          })
-      },
-      title: 'Grant terminal billing access?'
-    }
-  })
-}
+/**
+ * Run the Remote-Spending device flow and resolve whether the grant landed.
+ *
+ * The browser opens via the gateway's out-of-band `billing.step_up.verification`
+ * event (handled globally in createGatewayEventHandler), so this just kicks the
+ * blocking `billing.step_up` RPC and awaits its result. A reject (the device
+ * flow can outlive the RPC's timeout while the user is still authorizing) is
+ * treated as "not yet granted" — non-fatal; the grant persists gateway-side.
+ *
+ * NOTE: never surface the raw `billing:manage` scope — the user-facing concept
+ * is "Remote Spending".
+ */
+const requestRemoteSpending = (ctx: SlashRunCtx): Promise<boolean> =>
+  ctx.gateway
+    .rpc<BillingMutationResponse>('billing.step_up', { session_id: ctx.sid ?? undefined })
+    .then(r => !!(r && r.ok && r.granted))
+    .catch(() => false)
 
 /** Poll a charge to a terminal state (settled/failed/timeout). Non-blocking. */
 const pollCharge = (sys: Sys, ctx: SlashRunCtx, chargeId: string, portalUrl?: string | null): void => {
@@ -322,21 +283,39 @@ const buildOverlayCtx = (ctx: SlashRunCtx, sys: Sys, s: BillingStateResponse): B
 
         return false
       }),
-  charge: (amount: string) => {
+  charge: (amount: string): Promise<BillingChargeOutcome> => {
     sys('💳 Charge submitted — confirming settlement…')
-    ctx.gateway
+
+    return ctx.gateway
       .rpc<BillingChargeResponse>('billing.charge', { amount_usd: amount })
-      .then(
-        ctx.guarded<BillingChargeResponse>(r => {
-          if (r.ok && r.charge_id) {
-            pollCharge(sys, ctx, r.charge_id, s.portal_url)
-          } else {
-            renderBillingError(sys, ctx, r)
-          }
-        })
-      )
-      .catch(ctx.guardedErr)
+      .then((r): BillingChargeOutcome => {
+        if (!r) {
+          return 'error'
+        }
+
+        if (r.ok && r.charge_id) {
+          pollCharge(sys, ctx, r.charge_id, s.portal_url)
+
+          return 'submitted'
+        }
+
+        // insufficient_scope → the overlay routes to the resumable step-up
+        // (no error line here; the stepup screen owns that UX).
+        if (r.error === 'insufficient_scope') {
+          return 'needs_remote_spending'
+        }
+
+        renderBillingError(sys, ctx, r)
+
+        return 'error'
+      })
+      .catch((e): BillingChargeOutcome => {
+        ctx.guardedErr(e)
+
+        return 'error'
+      })
   },
+  requestRemoteSpending: () => requestRemoteSpending(ctx),
   openPortal: (url: string) => {
     openExternalUrl(url)
     sys(`Opening portal: ${url}`)

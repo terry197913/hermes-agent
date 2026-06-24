@@ -68,12 +68,21 @@ export function BillingOverlay({ onClose, onPatch, overlay, t }: BillingOverlayP
           ctx={ctx}
           onBack={() => onPatch({ pendingCharge: null, screen: 'buy' })}
           onClose={onClose}
+          onPatch={onPatch}
           s={s}
           t={t}
         />
       )}
       {screen === 'autoreload' && <AutoReloadScreen ctx={ctx} onClose={onClose} onPatch={onPatch} s={s} t={t} />}
       {screen === 'limit' && <LimitScreen ctx={ctx} onClose={onClose} onPatch={onPatch} s={s} t={t} />}
+      {screen === 'stepup' && (
+        <StepUpScreen
+          amount={overlay.pendingCharge?.amount ?? ''}
+          ctx={ctx}
+          onClose={onClose}
+          t={t}
+        />
+      )}
     </Box>
   )
 }
@@ -329,6 +338,7 @@ function ConfirmScreen({
   ctx,
   onBack,
   onClose,
+  onPatch,
   s,
   t
 }: {
@@ -336,16 +346,33 @@ function ConfirmScreen({
   ctx: BillingOverlayState['ctx']
   onBack: () => void
   onClose: () => void
+  onPatch: (next: Partial<BillingOverlayState>) => void
   s: BillingStateResponse
   t: Theme
 }) {
   // rows: Pay $X now / Cancel
   const [sel, setSel] = useState(0)
+  const [submitting, setSubmitting] = useState(false)
 
   const pay = () => {
-    ctx.charge(amount)
-    // Settlement is reported via transcript lines; close the overlay now.
-    onClose()
+    if (submitting) {
+      return
+    }
+
+    setSubmitting(true)
+    void ctx.charge(amount).then(outcome => {
+      if (outcome === 'needs_remote_spending') {
+        // Resumable step-up: keep the modal MOUNTED, switch to the stepup
+        // screen (which holds pendingCharge.amount for the post-grant replay).
+        onPatch({ screen: 'stepup' })
+
+        return
+      }
+
+      // submitted (settlement reported via transcript) or error (already
+      // surfaced) → close the overlay. The transcript carries the outcome.
+      onClose()
+    })
   }
 
   const back = () => onBack()
@@ -393,6 +420,118 @@ function ConfirmScreen({
       <ActionRow active={sel === 1} label="Cancel" t={t} />
       <Text />
       {footer('↑/↓ select · Enter confirm · Y/N quick · Esc back', t)}
+    </Box>
+  )
+}
+
+// ── Screen: Step-up (resumable "Allow Remote Spending") ───────────────
+// Reached when a charge returns insufficient_scope. The modal stays MOUNTED
+// through the browser device-flow: Allow → await the grant → replay the held
+// charge (pendingCharge.amount) without a command re-run. Never leaks the raw
+// billing:manage scope — the user-facing concept is "Remote Spending".
+
+function StepUpScreen({
+  amount,
+  ctx,
+  onClose,
+  t
+}: {
+  amount: string
+  ctx: BillingOverlayState['ctx']
+  onClose: () => void
+  t: Theme
+}) {
+  const [sel, setSel] = useState(0)
+  const [phase, setPhase] = useState<'prompt' | 'waiting'>('prompt')
+
+  const allow = () => {
+    if (phase === 'waiting') {
+      return
+    }
+
+    setPhase('waiting')
+    ctx.sys('Opening your browser to authorize Remote Spending…')
+
+    void ctx.requestRemoteSpending().then(granted => {
+      if (!granted) {
+        ctx.sys('🟡 Remote Spending was not granted (an org admin/owner must approve). Run /topup to try again.')
+        onClose()
+
+        return
+      }
+
+      // Granted → resume the held charge. Replay it; the confirm/poll lines
+      // report settlement, then close.
+      ctx.sys('✅ Remote Spending enabled — resuming your purchase.')
+      void ctx.charge(amount).then(() => onClose())
+    })
+  }
+
+  const decline = () => onClose()
+
+  useInput((ch, key) => {
+    if (phase === 'waiting') {
+      // While the device flow runs, only Esc (give up) is live.
+      if (key.escape) {
+        onClose()
+      }
+
+      return
+    }
+
+    if (key.escape) {
+      return decline()
+    }
+
+    const lower = ch.toLowerCase()
+
+    if (lower === 'y') {
+      return allow()
+    }
+
+    if (lower === 'n') {
+      return decline()
+    }
+
+    if (key.upArrow) {
+      setSel(0)
+    }
+
+    if (key.downArrow) {
+      setSel(1)
+    }
+
+    if (key.return) {
+      return sel === 0 ? allow() : decline()
+    }
+  })
+
+  if (phase === 'waiting') {
+    return (
+      <Box flexDirection="column">
+        <Text bold color={t.color.accent}>
+          Allow Remote Spending
+        </Text>
+        <Text color={t.color.muted}>Waiting for browser authorization…</Text>
+        <Text color={t.color.muted}>Approve in the page that just opened — your purchase resumes here automatically.</Text>
+        <Text />
+        {footer('Esc cancel', t)}
+      </Box>
+    )
+  }
+
+  return (
+    <Box flexDirection="column">
+      <Text bold color={t.color.accent}>
+        Allow Remote Spending
+      </Text>
+      <Text color={t.color.text}>Charging from the terminal needs a one-time browser authorization.</Text>
+      <Text color={t.color.muted}>We&apos;ll resume your ${amount} purchase right here once it&apos;s granted.</Text>
+      <Text />
+      <ActionRow active={sel === 0} color={t.color.ok} label="Allow Remote Spending" t={t} />
+      <ActionRow active={sel === 1} label="Not now" t={t} />
+      <Text />
+      {footer('↑/↓ select · Enter confirm · Y/N quick · Esc cancel', t)}
     </Box>
   )
 }

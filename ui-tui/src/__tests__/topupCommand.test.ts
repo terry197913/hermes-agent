@@ -231,19 +231,61 @@ describe('/billing slash command (overlay-driven)', () => {
     expect(out).toContain('Portal: /billing?topup=open')
   })
 
-  it('ctx.charge insufficient_scope → arms step-up confirm', async () => {
+  it('ctx.charge insufficient_scope → resolves needs_remote_spending (overlay routes to stepup)', async () => {
     const { run } = buildCtx({
       'billing.state': ownerState(),
       'billing.charge': { ok: false, error: 'insufficient_scope', idempotency_key: 'k' }
     })
 
     await run('')
-    getOverlayState().billing!.ctx.charge('100')
-    await Promise.resolve()
-    await Promise.resolve()
-    // The charge failed with insufficient_scope → a NEW confirm (step-up) is armed.
-    const stepUp = getOverlayState().confirm
-    expect(stepUp?.title).toBe('Grant terminal billing access?')
+    const outcome = await getOverlayState().billing!.ctx.charge('100')
+    // No separate confirm overlay is armed anymore — the overlay's stepup
+    // screen owns the UX; the ctx just reports the outcome.
+    expect(outcome).toBe('needs_remote_spending')
+    expect(getOverlayState().confirm).toBeNull()
+  })
+
+  it('ctx.requestRemoteSpending → billing.step_up, resolves granted', async () => {
+    const { run, calls } = buildCtx({
+      'billing.state': ownerState(),
+      'billing.step_up': { ok: true, granted: true }
+    })
+
+    await run('')
+    const granted = await getOverlayState().billing!.ctx.requestRemoteSpending()
+    expect(granted).toBe(true)
+    const su = calls.find(c => c.method === 'billing.step_up')
+    expect(su).toBeTruthy()
+  })
+
+  it('ctx.requestRemoteSpending → not granted resolves false', async () => {
+    const { run } = buildCtx({
+      'billing.state': ownerState(),
+      'billing.step_up': { ok: true, granted: false }
+    })
+
+    await run('')
+    const granted = await getOverlayState().billing!.ctx.requestRemoteSpending()
+    expect(granted).toBe(false)
+  })
+
+  it('ctx.charge happy path resolves submitted', async () => {
+    vi.useFakeTimers()
+
+    try {
+      const { run } = buildCtx({
+        'billing.state': ownerState(),
+        'billing.charge': { ok: true, charge_id: 'ch_1', idempotency_key: 'k' },
+        'billing.charge_status': { ok: true, status: 'settled', amount_usd: '100' }
+      })
+
+      await run('')
+      const outcome = await getOverlayState().billing!.ctx.charge('100')
+      expect(outcome).toBe('submitted')
+      await vi.runAllTimersAsync()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   // ── CF-4: revoked-terminal UX (kill the "15-minute zombie button") ──
